@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""ROS 2-only interactive G1 Inspire hand task controller.
+
+This mirrors g1-task-control.l but sends FollowJointTrajectory goals directly
+from rclpy, so ros1_bridge and roseus are not required.
+"""
+
+import math
+import sys
+import termios
+import tty
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
+import rclpy
+from control_msgs.action import FollowJointTrajectory
+from rclpy.action import ActionClient
+from rclpy.duration import Duration
+from rclpy.node import Node
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+
+HAND_JOINT_NAMES = {
+    "right": [
+        "R_thumb_proximal_yaw_joint",
+        "R_thumb_proximal_pitch_joint",
+        "R_index_proximal_joint",
+        "R_middle_proximal_joint",
+        "R_ring_proximal_joint",
+        "R_pinky_proximal_joint",
+    ],
+    "left": [
+        "L_thumb_proximal_yaw_joint",
+        "L_thumb_proximal_pitch_joint",
+        "L_index_proximal_joint",
+        "L_middle_proximal_joint",
+        "L_ring_proximal_joint",
+        "L_pinky_proximal_joint",
+    ],
+}
+
+CONTROLLER_NAMES = {
+    "right": "right_hand_controller",
+    "left": "left_hand_controller",
+}
+
+
+@dataclass(frozen=True)
+class Task:
+    name: str
+    default_hand: str
+    setting: Tuple[float, float, float, float, float, float]
+    prepare: Tuple[float, float, float, float, float, float]
+    grasp: Tuple[float, float, float, float, float, float]
+
+
+TASK_TABLE: Dict[int, Task] = {
+    1: Task(
+        "sprayer",
+        "right",
+        (23.835, 10.313, 58.442, 68.182, 68.182, 68.182),
+        (23.835, 10.313, 58.442, 90.585, 92.533, 93.507),
+        (23.835, 10.313, 77.922, 90.585, 92.533, 93.507),
+    ),
+    2: Task(
+        "vine-training-clip",
+        "right",
+        (74.485, 3.438, 38.961, 97.403, 97.403, 97.403),
+        (74.485, 3.438, 38.961, 97.403, 97.403, 97.403),
+        (74.485, 10.313, 48.701, 97.403, 97.403, 97.403),
+    ),
+    3: Task(
+        "grape-bag",
+        "right",
+        (74.485, 15.470, 48.701, 97.403, 97.403, 97.403),
+        (74.485, 15.470, 48.701, 97.403, 97.403, 97.403),
+        (74.485, 15.470, 55.520, 97.403, 97.403, 97.403),
+    ),
+    4: Task(
+        "cluster-thinning-pick",
+        "right",
+        (22.345, 5.157, 79.870, 82.792, 91.559, 95.455),
+        (22.345, 5.157, 79.870, 82.792, 91.559, 95.455),
+        (20.856, 17.189, 95.455, 95.455, 97.403, 97.403),
+    ),
+    5: Task(
+        "gibberellin-treatment-cup",
+        "right",
+        (74.485, 0.0, 31.169, 37.013, 40.909, 73.052),
+        (74.485, 0.0, 31.169, 37.013, 40.909, 73.052),
+        (74.485, 0.0, 42.857, 50.649, 56.494, 73.052),
+    ),
+    6: Task(
+        "gibberellin-tank",
+        "left",
+        (46.180, 0.0, 58.442, 58.442, 58.442, 58.442),
+        (46.180, 0.0, 58.442, 58.442, 58.442, 58.442),
+        (46.180, 30.940, 92.533, 92.533, 92.533, 92.533),
+    ),
+    7: Task(
+        "scissors",
+        "right",
+        (63.312, 9.282, 31.169, 42.857, 42.857, 29.221),
+        (63.312, 9.282, 45.779, 59.416, 67.208, 48.701),
+        (74.485, 18.908, 45.779, 59.416, 67.208, 48.701),
+    ),
+    8: Task(
+        "scissors-with-catcher",
+        "right",
+        (63.312, 9.282, 31.169, 42.857, 42.857, 29.221),
+        (63.312, 9.282, 43.831, 60.390, 68.182, 50.649),
+        (74.485, 16.845, 43.831, 60.390, 68.182, 50.649),
+    ),
+    9: Task(
+        "electric-pruning-shears",
+        "right",
+        (74.485, 0.0, 33.117, 46.753, 83.766, 85.714),
+        (74.485, 0.0, 33.117, 46.753, 83.766, 85.714),
+        (74.485, 0.0, 46.753, 46.753, 83.766, 85.714),
+    ),
+}
+
+OPEN_VALUES = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+# Matches inspire_hand_command --preset close after its 0..100 conversion.
+CLOSE_VALUES = tuple(math.degrees(value) for value in (0.3, 0.6, 1.7, 1.7, 1.7, 1.7))
+
+
+def format_command_values(values: Tuple[float, ...]) -> str:
+    return "(" + " ".join(f"{value:.3f}" for value in values) + ")"
+
+
+class G1TaskControl(Node):
+    def __init__(self) -> None:
+        super().__init__("g1_task_control")
+        self._action_clients = {
+            hand: ActionClient(
+                self,
+                FollowJointTrajectory,
+                f"/{controller}/follow_joint_trajectory",
+            )
+            for hand, controller in CONTROLLER_NAMES.items()
+        }
+        self.current_task: Optional[Task] = None
+        self.current_phase = "none"
+        self.selected_hand: Optional[str] = None
+        self.duration_sec = 1.0
+
+    def current_hand(self) -> str:
+        if self.selected_hand:
+            return self.selected_hand
+        if self.current_task:
+            return self.current_task.default_hand
+        return "left"
+
+    def list_tasks(self) -> None:
+        print("Tasks:")
+        for num, task in TASK_TABLE.items():
+            print(f"  {num}: {task.name} (default {task.default_hand})")
+
+    def help(self) -> None:
+        print("Commands:")
+        print("  r    : select right hand")
+        print("  l    : select left hand")
+        print("  1..9 : select task")
+        print("  s    : move selected hand to task setting angle")
+        print("  g    : toggle prepare-grasp <-> start-grasp")
+        print("  o    : open selected hand")
+        print("  c    : close selected hand")
+        print("  p    : list tasks")
+        print("  h    : show help")
+        print("  q    : close both hands and quit loop")
+
+    def init_task_control(self) -> None:
+        self.current_task = None
+        self.current_phase = "none"
+        self.selected_hand = None
+        self.list_tasks()
+        self.help()
+        print("G1 task control initialized.")
+
+    def select_hand(self, hand: str) -> None:
+        self.selected_hand = hand
+        if self.current_task:
+            self.current_phase = "selected"
+        print(f"Selected hand: {hand}.")
+        if self.current_task:
+            print(f"Current task: {self.current_task.name}. Press s for setting.")
+
+    def clear(self) -> None:
+        self.current_task = None
+        self.current_phase = "none"
+        print("Task selection canceled.")
+
+    def select_task(self, num: int) -> None:
+        task = TASK_TABLE.get(num)
+        if not task:
+            print(f"Unknown task number: {num}")
+            return
+        self.current_task = task
+        self.current_phase = "selected"
+        print(f"Selected {num}: {task.name} ({self.current_hand()}). Press s for setting.")
+
+    def selected_task(self) -> bool:
+        if self.current_task:
+            return True
+        print("Select a task number first.")
+        return False
+
+    def send_values(self, hand: str, values: Tuple[float, ...], phase_name: str) -> bool:
+        client = self._action_clients[hand]
+        action_name = f"/{CONTROLLER_NAMES[hand]}/follow_joint_trajectory"
+        if not client.wait_for_server(timeout_sec=2.0):
+            print(f"Action server is not available: {action_name}")
+            return False
+
+        trajectory = JointTrajectory()
+        trajectory.header.stamp = self.get_clock().now().to_msg()
+        trajectory.joint_names = HAND_JOINT_NAMES[hand]
+
+        point = JointTrajectoryPoint()
+        point.positions = [math.radians(value) for value in values]
+        point.time_from_start = Duration(seconds=self.duration_sec).to_msg()
+        trajectory.points = [point]
+
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = trajectory
+
+        goal_future = client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, goal_future)
+        goal_handle = goal_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            print(f"Goal rejected: {action_name}")
+            return False
+
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future)
+        result = result_future.result().result
+        if result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
+            print(f"{phase_name}: error code {result.error_code}: {result.error_string}")
+            return False
+        return True
+
+    def send_task_pose(self, pose_key: str, phase_name: str) -> None:
+        if not self.selected_task():
+            return
+        task = self.current_task
+        assert task is not None
+        values = getattr(task, pose_key)
+        hand = self.current_hand()
+        if self.send_values(hand, values, phase_name):
+            self.current_phase = phase_name
+            print(f"{phase_name}: {task.name} ({hand})")
+            print(format_command_values(values))
+
+    def setting(self) -> None:
+        self.send_task_pose("setting", "setting")
+
+    def grasp(self) -> None:
+        if not self.selected_task():
+            return
+        if self.current_phase in ("selected", "setting", "start-grasp"):
+            self.send_task_pose("prepare", "prepare-grasp")
+        elif self.current_phase == "prepare-grasp":
+            self.send_task_pose("grasp", "start-grasp")
+        else:
+            print("Press s before g.")
+
+    def open_hand(self, hand: Optional[str] = None) -> None:
+        hand = hand or self.current_hand()
+        if self.send_values(hand, OPEN_VALUES, "open"):
+            self.current_phase = "open"
+            print(f"open: {hand}")
+            print(format_command_values(OPEN_VALUES))
+
+    def close_hand(self, hand: Optional[str] = None) -> None:
+        hand = hand or self.current_hand()
+        if self.send_values(hand, CLOSE_VALUES, "close"):
+            self.current_phase = "close"
+            print(f"close: {hand}")
+            print(format_command_values(CLOSE_VALUES))
+
+    def close_both_hands(self) -> None:
+        ok = True
+        for hand in ("right", "left"):
+            ok = self.send_values(hand, CLOSE_VALUES, "close") and ok
+        if ok:
+            self.current_phase = "close"
+            print("close: both")
+            print(format_command_values(CLOSE_VALUES))
+
+
+    def _dispatch_command(self, cmd: str) -> bool:
+        if cmd.isdigit():
+            self.select_task(int(cmd))
+        elif cmd == "r":
+            self.select_hand("right")
+        elif cmd == "l":
+            self.select_hand("left")
+        elif cmd == "s":
+            self.setting()
+        elif cmd == "g":
+            self.grasp()
+        elif cmd == "o":
+            self.open_hand(self.current_hand())
+        elif cmd == "c":
+            self.close_hand(self.current_hand())
+        elif cmd == "p":
+            self.list_tasks()
+        elif cmd == "h":
+            self.help()
+        elif cmd == "q":
+            self.close_both_hands()
+            return False
+        else:
+            print(f"Unknown command: {cmd}")
+        return True
+
+    def _read_key(self) -> str:
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            return sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def run_loop(self) -> None:
+        self.help()
+        if sys.stdin.isatty():
+            print("Single-key mode. Press h for help, q to quit.")
+            while rclpy.ok():
+                print("> ", end="", flush=True)
+                try:
+                    cmd = self._read_key()
+                except KeyboardInterrupt:
+                    print()
+                    break
+
+                print(cmd)
+                cmd = cmd.strip()
+                if not cmd:
+                    continue
+                if not self._dispatch_command(cmd):
+                    break
+            return
+
+        while rclpy.ok():
+            try:
+                cmd = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+
+            if not cmd:
+                continue
+            if not self._dispatch_command(cmd):
+                break
+
+
+def main() -> None:
+    rclpy.init(args=sys.argv)
+    node = G1TaskControl()
+    try:
+        node.init_task_control()
+        node.run_loop()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
