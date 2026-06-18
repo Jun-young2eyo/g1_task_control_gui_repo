@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Tkinter GUI for the G1 Inspire hand task controller."""
+
+from __future__ import annotations
+
+import sys
+import threading
+import types
+import tkinter as tk
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
+from tkinter import messagebox, ttk
+
+import rclpy
+
+
+def _load_cli_controller():
+    source = Path(__file__).with_name("g1_task_control_ros2")
+    loader = SourceFileLoader("g1_task_control_ros2_shared", str(source))
+    spec = spec_from_loader(loader.name, loader)
+    if spec is None:
+        module = types.ModuleType(loader.name)
+        sys.modules[loader.name] = module
+        loader.exec_module(module)
+        return module
+    module = module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+_controller = _load_cli_controller()
+G1TaskControl = _controller.G1TaskControl
+TASK_TABLE = _controller.TASK_TABLE
+
+
+class G1TaskControlApp:
+    def __init__(self, root: tk.Tk, node: G1TaskControl) -> None:
+        self.root = root
+        self.node = node
+        self.busy = False
+        self.selected_hand = tk.StringVar(value=self.node.current_hand())
+        self.task_text = tk.StringVar(value="No task selected")
+        self.phase_text = tk.StringVar(value="Phase: none")
+        self.status_text = tk.StringVar(value="Ready")
+        self.duration_value = tk.StringVar(value=f"{self.node.duration_sec:.2f}")
+        self.duration_spinbox = None
+        self.manual_entry = None
+        self.manual_value = tk.StringVar(value="")
+        self.buttons = []
+
+        self.root.title("G1 Inspire Hand Control")
+        self.root.minsize(680, 520)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
+        self._build_ui()
+        self._bind_keys()
+        self._refresh_state()
+
+    def _build_ui(self) -> None:
+        outer = ttk.Frame(self.root, padding=12)
+        outer.grid(row=0, column=0, sticky="nsew")
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+
+        title = ttk.Label(outer, text="G1 Inspire Hand Control", font=("TkDefaultFont", 16, "bold"))
+        title.grid(row=0, column=0, sticky="w")
+
+        status = ttk.Frame(outer)
+        status.grid(row=1, column=0, sticky="ew", pady=(8, 12))
+        status.columnconfigure(0, weight=1)
+        status.columnconfigure(1, weight=1)
+        status.columnconfigure(2, weight=1)
+        ttk.Label(status, textvariable=self.task_text).grid(row=0, column=0, sticky="w")
+        ttk.Label(status, textvariable=self.phase_text).grid(row=0, column=1, sticky="w")
+        ttk.Label(status, textvariable=self.status_text).grid(row=0, column=2, sticky="e")
+
+        hand_frame = ttk.LabelFrame(outer, text="Hand")
+        hand_frame.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        hand_frame.columnconfigure(3, weight=1)
+        for index, hand in enumerate(("left", "right")):
+            button = ttk.Radiobutton(
+                hand_frame,
+                text=hand.capitalize(),
+                value=hand,
+                variable=self.selected_hand,
+                command=lambda hand=hand: self.select_hand(hand),
+            )
+            button.grid(row=0, column=index, padx=8, pady=8, sticky="w")
+        ttk.Label(hand_frame, text="Duration (sec, 0.1-5.0)").grid(row=0, column=2, padx=(24, 6), pady=8, sticky="e")
+        duration = ttk.Spinbox(
+            hand_frame,
+            from_=0.1,
+            to=5.0,
+            increment=0.1,
+            width=6,
+            textvariable=self.duration_value,
+            command=self.apply_duration,
+        )
+        duration.grid(row=0, column=3, padx=8, pady=8, sticky="w")
+        duration.bind("<Return>", lambda _event: self.apply_duration_and_release_focus())
+        duration.bind("<FocusOut>", lambda _event: self.apply_duration())
+        self.duration_spinbox = duration
+
+        tasks = ttk.LabelFrame(outer, text="Tasks")
+        tasks.grid(row=3, column=0, sticky="nsew", pady=(0, 12))
+        for col in range(3):
+            tasks.columnconfigure(col, weight=1)
+        for number, task in TASK_TABLE.items():
+            row = (number - 1) // 3
+            col = (number - 1) % 3
+            text = f"{number}. {task.name}"
+            button = ttk.Button(tasks, text=text, command=lambda number=number: self.select_task(number))
+            button.grid(row=row, column=col, sticky="ew", padx=6, pady=6)
+            self.buttons.append(button)
+
+        manual = ttk.LabelFrame(outer, text="Manual Angles (deg: thumb_yaw thumb_pitch index middle ring pinky)")
+        manual.grid(row=4, column=0, sticky="ew", pady=(0, 12))
+        manual.columnconfigure(0, weight=1)
+        entry = ttk.Entry(manual, textvariable=self.manual_value)
+        entry.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+        entry.bind("<Return>", lambda _event: self.send_manual_action())
+        self.manual_entry = entry
+        button = ttk.Button(manual, text="Send Manual", command=self.send_manual_action)
+        button.grid(row=0, column=1, sticky="ew", padx=6, pady=6)
+        self.buttons.append(button)
+
+        actions = ttk.LabelFrame(outer, text="Commands")
+        actions.grid(row=5, column=0, sticky="ew")
+        for col in range(3):
+            actions.columnconfigure(col, weight=1)
+
+        self._add_action(actions, "Setting", "s", self.node.setting, 0, 0)
+        self._add_action(actions, "Prepare / Start", "g", self.node.grasp, 0, 1)
+        self._add_action(actions, "Open", "o", lambda: self.node.open_hand(self.node.current_hand()), 0, 2)
+        self._add_action(actions, "Close", "c", lambda: self.node.close_hand(self.node.current_hand()), 1, 0)
+        self._add_action(actions, "Close Both + Quit", "q", self.close_both_and_quit, 1, 1, colspan=2)
+
+    def _add_action(self, parent, label, key, action, row, column, colspan=1) -> None:
+        button = ttk.Button(parent, text=f"{label} ({key})", command=lambda: self.run_action(label, action))
+        button.grid(row=row, column=column, columnspan=colspan, sticky="ew", padx=6, pady=6)
+        self.buttons.append(button)
+
+    def _bind_keys(self) -> None:
+        self.root.bind_all("r", lambda event: self._run_shortcut(event, lambda: self.select_hand("right")))
+        self.root.bind_all("l", lambda event: self._run_shortcut(event, lambda: self.select_hand("left")))
+        self.root.bind_all("s", lambda event: self._run_shortcut(event, lambda: self.run_action("Setting", self.node.setting)))
+        self.root.bind_all("g", lambda event: self._run_shortcut(event, lambda: self.run_action("Prepare / Start", self.node.grasp)))
+        self.root.bind_all("o", lambda event: self._run_shortcut(event, lambda: self.run_action("Open", lambda: self.node.open_hand(self.node.current_hand()))))
+        self.root.bind_all("c", lambda event: self._run_shortcut(event, lambda: self.run_action("Close", lambda: self.node.close_hand(self.node.current_hand()))))
+        self.root.bind_all("q", lambda event: self._run_shortcut(event, lambda: self.run_action("Close Both + Quit", self.close_both_and_quit)))
+        for number in TASK_TABLE:
+            self.root.bind_all(str(number), lambda event, number=number: self._run_shortcut(event, lambda: self.select_task(number)))
+
+    def _run_shortcut(self, event, action):
+        if event.widget in (self.duration_spinbox, self.manual_entry):
+            return None
+        action()
+        return "break"
+
+    def apply_duration(self) -> bool:
+        try:
+            duration = float(self.duration_value.get())
+        except ValueError:
+            messagebox.showerror("G1 Inspire Hand Control", "Duration must be a number.")
+            self.duration_value.set(f"{self.node.duration_sec:.2f}")
+            return False
+        if not 0.1 <= duration <= 5.0:
+            messagebox.showerror("G1 Inspire Hand Control", "Duration must be between 0.1 and 5.0 seconds.")
+            self.duration_value.set(f"{self.node.duration_sec:.2f}")
+            return False
+        self.node.duration_sec = duration
+        self.duration_value.set(f"{duration:.2f}")
+        self.status_text.set(f"Duration: {duration:.2f} sec")
+        return True
+
+    def apply_duration_and_release_focus(self) -> str:
+        if self.apply_duration():
+            self.root.focus_set()
+        return "break"
+
+    def select_hand(self, hand: str) -> None:
+        if self.busy:
+            return
+        self.node.select_hand(hand)
+        self.selected_hand.set(hand)
+        self._refresh_state(f"Selected {hand} hand")
+
+    def select_task(self, number: int) -> None:
+        if self.busy:
+            return
+        self.node.select_task(number)
+        self.selected_hand.set(self.node.current_hand())
+        self._refresh_state(f"Selected task {number}")
+
+    def run_action(self, label: str, action) -> None:
+        if self.busy:
+            return
+        if not self.apply_duration():
+            return
+        self._set_busy(True, f"Running {label}...")
+
+        def worker() -> None:
+            error = None
+            try:
+                action()
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+            self.root.after(0, lambda: self._finish_action(label, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def parse_manual_values(self) -> tuple[float, ...] | None:
+        raw = self.manual_value.get().strip().replace(",", " ").split()
+        if len(raw) != 6:
+            messagebox.showerror(
+                "G1 Inspire Hand Control",
+                "Enter exactly six degree values: thumb_yaw thumb_pitch index middle ring pinky.",
+            )
+            return None
+        try:
+            return tuple(float(value) for value in raw)
+        except ValueError:
+            messagebox.showerror("G1 Inspire Hand Control", "Manual angles must be numbers.")
+            return None
+
+    def send_manual_action(self) -> None:
+        if self.busy:
+            return
+        if not self.apply_duration():
+            return
+        values = self.parse_manual_values()
+        if values is None:
+            return
+        hand = self.node.current_hand()
+        self._set_busy(True, "Running Manual...")
+
+        def worker() -> None:
+            error = None
+            try:
+                if self.node.send_values(hand, values, "manual"):
+                    self.node.current_phase = "manual"
+                    print(f"manual: {hand}")
+                    print(_controller.format_command_values(values))
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+            self.root.after(0, lambda: self._finish_action("Manual", error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def close_both_and_quit(self) -> None:
+        self.node.close_both_hands()
+        self.root.after(0, self.root.quit)
+
+    def _finish_action(self, label: str, error: Exception | None) -> None:
+        self._set_busy(False)
+        if error is not None:
+            self.status_text.set(f"Failed: {label}")
+            messagebox.showerror("G1 Inspire Hand Control", str(error))
+            return
+        self._refresh_state(f"Done: {label}")
+
+    def _set_busy(self, busy: bool, status: str | None = None) -> None:
+        self.busy = busy
+        state = "disabled" if busy else "normal"
+        for button in self.buttons:
+            button.configure(state=state)
+        if status is not None:
+            self.status_text.set(status)
+
+    def _refresh_state(self, status: str | None = None) -> None:
+        if self.node.current_task is None:
+            self.task_text.set("No task selected")
+        else:
+            self.task_text.set(f"Task: {self.node.current_task.name}")
+        self.phase_text.set(f"Phase: {self.node.current_phase}")
+        self.selected_hand.set(self.node.current_hand())
+        if status is not None:
+            self.status_text.set(status)
+
+    def on_window_close(self) -> None:
+        if self.busy:
+            return
+        self.root.destroy()
+
+
+def main() -> None:
+    rclpy.init(args=sys.argv)
+    node = G1TaskControl()
+    root = tk.Tk()
+    try:
+        node.init_task_control()
+        G1TaskControlApp(root, node)
+        root.mainloop()
+    finally:
+        root.destroy()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
