@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import threading
 import types
@@ -35,8 +36,12 @@ G1TaskControl = _controller.G1TaskControl
 TASK_TABLE = _controller.TASK_TABLE
 MANUAL_JOINT_LABELS = ("Thumb yaw", "Thumb pitch", "Index", "Middle", "Ring", "Pinky")
 MANUAL_SLIDER_MIN = 0.0
-MANUAL_SLIDER_MAX = 100.0
+MANUAL_SLIDER_MAX_VALUES = tuple(math.degrees(value) for value in (1.3, 0.6, 1.7, 1.7, 1.7, 1.7))
 MANUAL_SLIDER_DURATION_SEC = 0.1
+MANUAL_SLIDER_KEY_STEP = 0.1
+MANUAL_SLIDER_SHIFT_KEY_STEP = 1.0
+FOCUS_BORDER_COLOR = "#1e88ff"
+NORMAL_BORDER_COLOR = "#d0d0d0"
 
 
 class G1TaskControlApp:
@@ -60,10 +65,13 @@ class G1TaskControlApp:
         self.manual_slider_after_id = None
         self.manual_slider_worker_running = False
         self.manual_slider_updating = False
+        self.selected_task_number = None
+        self.task_button_frames = {}
         self.buttons = []
 
+        self._configure_focus_styles()
         self.root.title("G1 Inspire Hand Control")
-        self.root.minsize(680, 520)
+        self.root.minsize(680, 620)
         self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
         self._build_ui()
         self._bind_keys()
@@ -100,6 +108,7 @@ class G1TaskControlApp:
                 command=lambda hand=hand: self.select_hand(hand),
             )
             button.grid(row=0, column=index, padx=8, pady=8, sticky="w")
+            self._bind_focus_style(button, "TRadiobutton", "Focused.TRadiobutton")
         ttk.Label(hand_frame, text="Duration (sec, 0.1-5.0)").grid(row=0, column=2, padx=(24, 6), pady=8, sticky="e")
         duration = ttk.Spinbox(
             hand_frame,
@@ -123,9 +132,9 @@ class G1TaskControlApp:
             row = (number - 1) // 3
             col = (number - 1) % 3
             text = f"{number}. {task.name}"
-            button = ttk.Button(tasks, text=text, command=lambda number=number: self.select_task(number))
-            button.grid(row=row, column=col, sticky="ew", padx=6, pady=6)
-            self.buttons.append(button)
+            button = self._add_button(tasks, text, lambda number=number: self.select_task(number), row, col, bind_focus=False)
+            self.task_button_frames[number] = button._focus_frame
+            self._bind_task_button_focus(button, number)
 
         manual = ttk.LabelFrame(outer, text="Manual Angles (deg: thumb_yaw thumb_pitch index middle ring pinky)")
         manual.grid(row=4, column=0, sticky="ew", pady=(0, 12))
@@ -134,24 +143,30 @@ class G1TaskControlApp:
         entry.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=6)
         entry.bind("<Return>", lambda _event: self.send_manual_action())
         self.manual_entry = entry
-        button = ttk.Button(manual, text="Send Manual", command=self.send_manual_action)
-        button.grid(row=0, column=2, sticky="ew", padx=6, pady=6)
-        self.buttons.append(button)
+        self._add_button(manual, "Send Manual", self.send_manual_action, 0, 2)
 
-        for index, label in enumerate(MANUAL_JOINT_LABELS):
+        for index, (label, max_value) in enumerate(zip(MANUAL_JOINT_LABELS, MANUAL_SLIDER_MAX_VALUES)):
             value = tk.DoubleVar(value=0.0)
             self.manual_slider_vars.append(value)
             ttk.Label(manual, text=label).grid(row=index + 1, column=0, sticky="w", padx=6, pady=2)
             slider = ttk.Scale(
                 manual,
                 from_=MANUAL_SLIDER_MIN,
-                to=MANUAL_SLIDER_MAX,
+                to=max_value,
                 variable=value,
                 command=lambda _value, index=index: self.on_manual_slider_change(index),
             )
             slider.grid(row=index + 1, column=1, sticky="ew", padx=6, pady=2)
-            slider.bind("<ButtonPress-1>", self.start_manual_slider_drag)
+            slider.bind("<ButtonPress-1>", lambda event, index=index: self.start_manual_slider_drag(event, index))
             slider.bind("<ButtonRelease-1>", self.finish_manual_slider_drag)
+            slider.bind("<Left>", lambda event, index=index: self.adjust_manual_slider_with_key(event, index, -1))
+            slider.bind("<Right>", lambda event, index=index: self.adjust_manual_slider_with_key(event, index, 1))
+            slider.bind("<Shift-Left>", lambda event, index=index: self.adjust_manual_slider_with_key(event, index, -1, shifted=True))
+            slider.bind("<Shift-Right>", lambda event, index=index: self.adjust_manual_slider_with_key(event, index, 1, shifted=True))
+            slider.bind("<Up>", lambda event, index=index: self.focus_manual_slider(event, index - 1))
+            slider.bind("<Down>", lambda event, index=index: self.focus_manual_slider(event, index + 1))
+            slider.bind("<FocusIn>", lambda event: event.widget.configure(style="Focused.Horizontal.TScale"))
+            slider.bind("<FocusOut>", lambda event: event.widget.configure(style="Horizontal.TScale"))
             self.manual_slider_widgets.append(slider)
             value_label = ttk.Label(manual, text="0.0", width=6, anchor="e")
             value_label.grid(row=index + 1, column=2, sticky="e", padx=6, pady=2)
@@ -168,10 +183,63 @@ class G1TaskControlApp:
         self._add_action(actions, "Close", "c", lambda: self.node.close_hand(self.node.current_hand()), 1, 0)
         self._add_action(actions, "Close Both + Quit", "q", self.close_both_and_quit, 1, 1, colspan=2)
 
-    def _add_action(self, parent, label, key, action, row, column, colspan=1) -> None:
-        button = ttk.Button(parent, text=f"{label} ({key})", command=lambda: self.run_action(label, action))
-        button.grid(row=row, column=column, columnspan=colspan, sticky="ew", padx=6, pady=6)
+    def _configure_focus_styles(self) -> None:
+        self.style = ttk.Style()
+        self.style.configure("Focused.TButton", borderwidth=3, relief="solid", bordercolor=FOCUS_BORDER_COLOR, focuscolor=FOCUS_BORDER_COLOR)
+        self.style.map("Focused.TButton", relief=[("focus", "solid"), ("!focus", "solid")])
+        self.style.configure("Focused.TRadiobutton", focuscolor=FOCUS_BORDER_COLOR, foreground=FOCUS_BORDER_COLOR)
+        self.style.configure("Focused.Horizontal.TScale", background=FOCUS_BORDER_COLOR, troughcolor="#d8eaff")
+
+    def _bind_focus_style(self, widget, normal_style: str, focused_style: str) -> None:
+        widget.configure(takefocus=True)
+        widget.bind("<ButtonPress-1>", lambda event: event.widget.focus_set(), add="+")
+        widget.bind("<FocusIn>", lambda _event: widget.configure(style=focused_style), add="+")
+        widget.bind("<FocusOut>", lambda _event: widget.configure(style=normal_style), add="+")
+
+    def _set_slider_focus(self, frame, focused: bool) -> None:
+        color = FOCUS_BORDER_COLOR if focused else NORMAL_BORDER_COLOR
+        frame.configure(highlightbackground=color, highlightcolor=color)
+
+    def _bind_focus_border(self, widget, frame) -> None:
+        widget.configure(takefocus=True)
+        widget.bind("<ButtonPress-1>", lambda event: event.widget.focus_set(), add="+")
+        widget.bind("<FocusIn>", lambda _event: self._set_slider_focus(frame, True), add="+")
+        widget.bind("<FocusOut>", lambda _event: self._set_slider_focus(frame, False), add="+")
+
+    def _bind_task_button_focus(self, button, number: int) -> None:
+        button.configure(takefocus=True)
+        button.bind("<ButtonPress-1>", lambda event: event.widget.focus_set(), add="+")
+        button.bind("<FocusIn>", lambda _event, number=number: self._update_task_button_frame(number, True), add="+")
+        button.bind("<FocusOut>", lambda _event, number=number: self._update_task_button_frame(number, False), add="+")
+
+    def _update_task_button_frame(self, number: int, focused: bool = False) -> None:
+        frame = self.task_button_frames.get(number)
+        if frame is None:
+            return
+        color = FOCUS_BORDER_COLOR if focused or number == self.selected_task_number else NORMAL_BORDER_COLOR
+        frame.configure(highlightbackground=color, highlightcolor=color)
+
+    def _refresh_task_button_selection(self) -> None:
+        focused = self.root.focus_get()
+        for number, frame in self.task_button_frames.items():
+            is_focused = getattr(focused, "_focus_frame", None) is frame
+            color = FOCUS_BORDER_COLOR if is_focused or number == self.selected_task_number else NORMAL_BORDER_COLOR
+            frame.configure(highlightbackground=color, highlightcolor=color)
+
+    def _add_button(self, parent, text: str, command, row: int, column: int, colspan: int = 1, bind_focus: bool = True):
+        frame = tk.Frame(parent, highlightthickness=2, highlightbackground=NORMAL_BORDER_COLOR, bd=0)
+        frame.grid(row=row, column=column, columnspan=colspan, sticky="ew", padx=6, pady=6)
+        frame.columnconfigure(0, weight=1)
+        button = ttk.Button(frame, text=text, command=command)
+        button._focus_frame = frame
+        button.grid(row=0, column=0, sticky="ew", padx=1, pady=1)
+        if bind_focus:
+            self._bind_focus_border(button, frame)
         self.buttons.append(button)
+        return button
+
+    def _add_action(self, parent, label, key, action, row, column, colspan=1) -> None:
+        self._add_button(parent, f"{label} ({key})", lambda: self.run_action(label, action), row, column, colspan)
 
     def _bind_keys(self) -> None:
         self.root.bind_all("<Button-1>", self._release_entry_focus_on_click, add="+")
@@ -231,7 +299,9 @@ class G1TaskControlApp:
         if self.busy:
             return
         self.node.select_task(number)
+        self.selected_task_number = number
         self.selected_hand.set(self.node.current_hand())
+        self._refresh_task_button_selection()
         self._refresh_state(f"Selected task {number}")
 
     def run_action(self, label: str, action) -> None:
@@ -257,9 +327,12 @@ class G1TaskControlApp:
     def set_manual_slider_values(self, values: tuple[float, ...]) -> None:
         self.manual_slider_updating = True
         try:
-            for variable, value_label, value in zip(self.manual_slider_vars, self.manual_slider_value_labels, values):
-                variable.set(value)
-                value_label.configure(text=f"{value:.1f}")
+            for variable, value_label, value, max_value in zip(
+                self.manual_slider_vars, self.manual_slider_value_labels, values, MANUAL_SLIDER_MAX_VALUES
+            ):
+                slider_value = min(max(value, MANUAL_SLIDER_MIN), max_value)
+                variable.set(slider_value)
+                value_label.configure(text=f"{slider_value:.1f}")
             self.manual_value.set(" ".join(f"{value:.3f}" for value in values))
         finally:
             self.manual_slider_updating = False
@@ -272,7 +345,8 @@ class G1TaskControlApp:
             return
         self.queue_manual_slider_send()
 
-    def start_manual_slider_drag(self, _event) -> None:
+    def start_manual_slider_drag(self, event, _index: int) -> None:
+        event.widget.focus_set()
         if self.busy or self.manual_slider_worker_running:
             return
         if not self.apply_duration():
@@ -285,6 +359,26 @@ class G1TaskControlApp:
             return
         self.queue_manual_slider_send()
         self.manual_slider_active = False
+
+    def adjust_manual_slider_with_key(self, event, index: int, direction: int, shifted: bool = False):
+        if self.busy or self.manual_slider_worker_running:
+            return "break"
+        if not self.apply_duration():
+            return "break"
+        step = MANUAL_SLIDER_SHIFT_KEY_STEP if shifted else MANUAL_SLIDER_KEY_STEP
+        value = self.manual_slider_vars[index].get() + direction * step
+        max_value = MANUAL_SLIDER_MAX_VALUES[index]
+        value = min(max(value, MANUAL_SLIDER_MIN), max_value)
+        self.manual_slider_vars[index].set(value)
+        self.on_manual_slider_change(index)
+        self.queue_manual_slider_send()
+        event.widget.focus_set()
+        return "break"
+
+    def focus_manual_slider(self, _event, index: int):
+        index = min(max(index, 0), len(self.manual_slider_widgets) - 1)
+        self.manual_slider_widgets[index].focus_set()
+        return "break"
 
     def queue_manual_slider_send(self) -> None:
         if self.busy:

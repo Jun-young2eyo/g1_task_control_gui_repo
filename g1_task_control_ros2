@@ -122,7 +122,7 @@ TASK_TABLE: Dict[int, Task] = {
 
 OPEN_VALUES = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 # Matches inspire_hand_command --preset close after its 0..100 conversion.
-CLOSE_VALUES = tuple(math.degrees(value) for value in (0.3, 0.6, 1.7, 1.7, 1.7, 1.7))
+CLOSE_VALUES = tuple(math.degrees(value) for value in (0.0, 0.6, 1.7, 1.7, 1.7, 1.7))
 
 
 def format_command_values(values: Tuple[float, ...]) -> str:
