@@ -258,7 +258,7 @@ class G1TaskControl(Node):
     def grasp(self) -> None:
         if not self.selected_task():
             return
-        if self.current_phase in ("selected", "setting", "start-grasp"):
+        if self.current_phase in ("selected", "setting", "manual", "start-grasp"):
             self.send_task_pose("prepare", "prepare-grasp")
         elif self.current_phase == "prepare-grasp":
             self.send_task_pose("grasp", "start-grasp")

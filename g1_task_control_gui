@@ -33,6 +33,10 @@ def _load_cli_controller():
 _controller = _load_cli_controller()
 G1TaskControl = _controller.G1TaskControl
 TASK_TABLE = _controller.TASK_TABLE
+MANUAL_JOINT_LABELS = ("Thumb yaw", "Thumb pitch", "Index", "Middle", "Ring", "Pinky")
+MANUAL_SLIDER_MIN = 0.0
+MANUAL_SLIDER_MAX = 100.0
+MANUAL_SLIDER_DURATION_SEC = 0.1
 
 
 class G1TaskControlApp:
@@ -48,6 +52,14 @@ class G1TaskControlApp:
         self.duration_spinbox = None
         self.manual_entry = None
         self.manual_value = tk.StringVar(value="")
+        self.manual_slider_vars = []
+        self.manual_slider_value_labels = []
+        self.manual_slider_widgets = []
+        self.manual_slider_active = False
+        self.manual_slider_pending = None
+        self.manual_slider_after_id = None
+        self.manual_slider_worker_running = False
+        self.manual_slider_updating = False
         self.buttons = []
 
         self.root.title("G1 Inspire Hand Control")
@@ -117,14 +129,33 @@ class G1TaskControlApp:
 
         manual = ttk.LabelFrame(outer, text="Manual Angles (deg: thumb_yaw thumb_pitch index middle ring pinky)")
         manual.grid(row=4, column=0, sticky="ew", pady=(0, 12))
-        manual.columnconfigure(0, weight=1)
+        manual.columnconfigure(1, weight=1)
         entry = ttk.Entry(manual, textvariable=self.manual_value)
-        entry.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+        entry.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=6)
         entry.bind("<Return>", lambda _event: self.send_manual_action())
         self.manual_entry = entry
         button = ttk.Button(manual, text="Send Manual", command=self.send_manual_action)
-        button.grid(row=0, column=1, sticky="ew", padx=6, pady=6)
+        button.grid(row=0, column=2, sticky="ew", padx=6, pady=6)
         self.buttons.append(button)
+
+        for index, label in enumerate(MANUAL_JOINT_LABELS):
+            value = tk.DoubleVar(value=0.0)
+            self.manual_slider_vars.append(value)
+            ttk.Label(manual, text=label).grid(row=index + 1, column=0, sticky="w", padx=6, pady=2)
+            slider = ttk.Scale(
+                manual,
+                from_=MANUAL_SLIDER_MIN,
+                to=MANUAL_SLIDER_MAX,
+                variable=value,
+                command=lambda _value, index=index: self.on_manual_slider_change(index),
+            )
+            slider.grid(row=index + 1, column=1, sticky="ew", padx=6, pady=2)
+            slider.bind("<ButtonPress-1>", self.start_manual_slider_drag)
+            slider.bind("<ButtonRelease-1>", self.finish_manual_slider_drag)
+            self.manual_slider_widgets.append(slider)
+            value_label = ttk.Label(manual, text="0.0", width=6, anchor="e")
+            value_label.grid(row=index + 1, column=2, sticky="e", padx=6, pady=2)
+            self.manual_slider_value_labels.append(value_label)
 
         actions = ttk.LabelFrame(outer, text="Commands")
         actions.grid(row=5, column=0, sticky="ew")
@@ -143,6 +174,7 @@ class G1TaskControlApp:
         self.buttons.append(button)
 
     def _bind_keys(self) -> None:
+        self.root.bind_all("<Button-1>", self._release_entry_focus_on_click, add="+")
         self.root.bind_all("r", lambda event: self._run_shortcut(event, lambda: self.select_hand("right")))
         self.root.bind_all("l", lambda event: self._run_shortcut(event, lambda: self.select_hand("left")))
         self.root.bind_all("s", lambda event: self._run_shortcut(event, lambda: self.run_action("Setting", self.node.setting)))
@@ -158,6 +190,14 @@ class G1TaskControlApp:
             return None
         action()
         return "break"
+
+    def _release_entry_focus_on_click(self, event):
+        if event.widget in (self.duration_spinbox, self.manual_entry):
+            return None
+        if event.widget in self.manual_slider_widgets:
+            return None
+        self.root.after_idle(self.root.focus_set)
+        return None
 
     def apply_duration(self) -> bool:
         try:
@@ -195,7 +235,7 @@ class G1TaskControlApp:
         self._refresh_state(f"Selected task {number}")
 
     def run_action(self, label: str, action) -> None:
-        if self.busy:
+        if self.busy or self.manual_slider_worker_running:
             return
         if not self.apply_duration():
             return
@@ -210,6 +250,93 @@ class G1TaskControlApp:
             self.root.after(0, lambda: self._finish_action(label, error))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def current_manual_slider_values(self) -> tuple[float, ...]:
+        return tuple(value.get() for value in self.manual_slider_vars)
+
+    def set_manual_slider_values(self, values: tuple[float, ...]) -> None:
+        self.manual_slider_updating = True
+        try:
+            for variable, value_label, value in zip(self.manual_slider_vars, self.manual_slider_value_labels, values):
+                variable.set(value)
+                value_label.configure(text=f"{value:.1f}")
+            self.manual_value.set(" ".join(f"{value:.3f}" for value in values))
+        finally:
+            self.manual_slider_updating = False
+
+    def on_manual_slider_change(self, index: int) -> None:
+        values = self.current_manual_slider_values()
+        self.manual_slider_value_labels[index].configure(text=f"{values[index]:.1f}")
+        self.manual_value.set(" ".join(f"{value:.3f}" for value in values))
+        if self.manual_slider_updating or not self.manual_slider_active:
+            return
+        self.queue_manual_slider_send()
+
+    def start_manual_slider_drag(self, _event) -> None:
+        if self.busy or self.manual_slider_worker_running:
+            return
+        if not self.apply_duration():
+            return
+        self.manual_slider_active = True
+        self.queue_manual_slider_send()
+
+    def finish_manual_slider_drag(self, _event) -> None:
+        if not self.manual_slider_active:
+            return
+        self.queue_manual_slider_send()
+        self.manual_slider_active = False
+
+    def queue_manual_slider_send(self) -> None:
+        if self.busy:
+            return
+        self.manual_slider_pending = self.current_manual_slider_values()
+        if self.manual_slider_worker_running or self.manual_slider_after_id is not None:
+            return
+        self.manual_slider_after_id = self.root.after(80, self.start_pending_manual_slider_send)
+
+    def start_pending_manual_slider_send(self) -> None:
+        self.manual_slider_after_id = None
+        if self.busy or self.manual_slider_worker_running or self.manual_slider_pending is None:
+            return
+        values = self.manual_slider_pending
+        self.manual_slider_pending = None
+        hand = self.node.current_hand()
+        self.manual_slider_worker_running = True
+        self.status_text.set("Running Manual slider...")
+
+        def worker() -> None:
+            error = None
+            success = False
+            original_duration = self.node.duration_sec
+            try:
+                self.node.duration_sec = min(original_duration, MANUAL_SLIDER_DURATION_SEC)
+                success = self.node.send_values(hand, values, "manual-slider")
+                if success:
+                    self.node.current_phase = "manual"
+                    print(f"manual-slider: {hand}")
+                    print(_controller.format_command_values(values))
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+            finally:
+                self.node.duration_sec = original_duration
+            self.root.after(0, lambda: self.finish_manual_slider_send(error, success))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_manual_slider_send(self, error: Exception | None, success: bool) -> None:
+        self.manual_slider_worker_running = False
+        if error is not None:
+            self.status_text.set("Failed: Manual slider")
+            messagebox.showerror("G1 Inspire Hand Control", str(error))
+            self.manual_slider_pending = None
+            return
+        if self.manual_slider_pending is not None:
+            self.manual_slider_after_id = self.root.after(40, self.start_pending_manual_slider_send)
+            return
+        if success:
+            self._refresh_state("Done: Manual slider")
+        else:
+            self.status_text.set("Manual slider command was not accepted")
 
     def parse_manual_values(self) -> tuple[float, ...] | None:
         raw = self.manual_value.get().strip().replace(",", " ").split()
@@ -226,13 +353,14 @@ class G1TaskControlApp:
             return None
 
     def send_manual_action(self) -> None:
-        if self.busy:
+        if self.busy or self.manual_slider_worker_running:
             return
         if not self.apply_duration():
             return
         values = self.parse_manual_values()
         if values is None:
             return
+        self.set_manual_slider_values(values)
         hand = self.node.current_hand()
         self._set_busy(True, "Running Manual...")
 
